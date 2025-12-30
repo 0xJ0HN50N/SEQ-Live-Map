@@ -1,0 +1,561 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>SEQ Cartesian — Restored & Extended (bus stops fixed)</title>
+
+<!-- Bootstrap (kept) -->
+<link href="https://stackpath.bootstrapcdn.com/bootstrap/4.3.1/css/bootstrap.min.css" rel="stylesheet">
+
+<!-- Leaflet -->
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin=""/>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" crossorigin=""></script>
+
+<!-- protobufjs (same approach you used originally) -->
+<script src="https://cdn.jsdelivr.net/npm/protobufjs@6.11.2/dist/protobuf.min.js"></script>
+
+<!-- markercluster (for train stops / cameras clustering if used) -->
+<link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css"/>
+<link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.Default.css"/>
+<script src="https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js"></script>
+
+<style>
+  body {
+    background: linear-gradient(to bottom, #0f0fad, #a80303);
+    font-family: Arial, sans-serif;
+    margin: 0;
+    height: 100vh;
+    overflow: hidden;
+  }
+  .navbar { background-color: #343a40; }
+  .navbar-brand, .navbar-nav .nav-link { color: #fff; }
+  #map { position: absolute; top: 140px; bottom: 0; left: 0; right: 0; }
+  #sidebar {
+    position: absolute; top: 80px; left: 10px; z-index:1200;
+    background: rgba(0,0,0,0.86); color:white; padding:10px;
+    border-radius:8px; max-width:340px; font-size:14px;
+  }
+  #sidebar h5 { margin-top:0; }
+  .camera-img { width:300px; height:auto; display:block; }
+  .leaflet-popup-content { max-width:360px; }
+
+  /* tiny bus stop marker style (not used directly - we use circleMarker) */
+  .bus-dot { width:6px; height:6px; border-radius:50%; background:#ff9900; border:1px solid #333; }
+</style>
+</head>
+<body>
+<nav class="navbar navbar-expand-lg navbar-dark">
+  <a class="navbar-brand" href="#">SEQ</a>
+</nav>
+
+<!-- Sidebar controls (kept style & cameras UI intact) -->
+<div id="sidebar">
+  <h5>Layers & Controls</h5>
+  <div><label><input id="traceToggle" type="checkbox"> Enable Tracing</label></div>
+  <div><label><input id="toggleVehicles" type="checkbox" checked> Live Vehicles</label></div>
+  <div><label><input id="toggleCameras" type="checkbox" checked> Traffic Cameras</label></div>
+  <div><label><input id="toggleIncidents" type="checkbox" checked> Road Incidents</label></div>
+  <div><label><input id="toggleTrainStops" type="checkbox" checked> Train Stops</label></div>
+  <div><label><input id="toggleBusStops" type="checkbox"> Bus Stops</label></div>
+  <div><label><input id="toggleRailLines" type="checkbox"> Rail Lines</label></div>
+  <div><label><input id="toggleParks" type="checkbox"> Parks</label></div>
+  <div><label><input id="toggleInfrastructure" type="checkbox"> Infrastructure</label></div>
+
+
+
+
+  <hr style="border-top:1px solid rgba(255,255,255,0.08)"/>
+  <div style="font-size:13px;color:#ddd">
+    Refresh interval:
+    <select id="refreshInterval"><option value="15000">15s</option><option value="30000" selected>30s</option><option value="60000">60s</option></select>
+  </div>
+  <div id="status" style="margin-top:8px;color:#ffdf70;font-size:13px;"></div>
+</div>
+
+<div id="map"></div>
+
+<!-- keep bootstrap/js includes (original) -->
+<script src="https://code.jquery.com/jquery-3.3.1.slim.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/popper.js/1.14.7/umd/popper.min.js"></script>
+<script src="https://stackpath.bootstrapcdn.com/bootstrap/4.3.1/js/bootstrap.min.js"></script>
+
+<script>
+/* ================= Utilities & Status ================= */
+const statusEl = document.getElementById('status');
+function setStatus(msg) { statusEl.textContent = msg; console.log('[SEQ Cartesian] ' + msg); }
+
+/* ================= Leaflet init with base map control ================= */
+const osmLayer = L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19, attribution: '&copy; OSM' });
+const darkLayer = L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+  attribution: '&copy; OSM & Carto', subdomains:'abcd', maxZoom:19
+});
+const satelliteLayer = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
+  attribution: 'Tiles &copy; Esri', maxZoom:19
+});
+
+const map = L.map('map', {
+  center: [-27.480642734870674, 153.02918638967117],
+  zoom: 10,
+  layers: [osmLayer] // keep OSM as the initial default so your previous behaviour remains
+});
+L.control.layers({ "OSM": osmLayer, "Dark": darkLayer, "Satellite": satelliteLayer }).addTo(map);
+L.control.scale().addTo(map);
+
+/* ================= Layers containers ================= */
+const vehicleLayer = L.layerGroup(); // live vehicles & traces
+const cameraLayer = L.layerGroup();  // cameras cluster added inside later
+const incidentLayer = L.layerGroup();
+const trainStopsCluster = L.markerClusterGroup(); // train stops (keep clustering for them)
+const busStopsLayer = L.layerGroup(); // <-- NO clustering for bus stops now
+const railLinesLayer = L.layerGroup(); // rail polylines
+
+/* default toggles */
+if (document.getElementById('toggleVehicles').checked) map.addLayer(vehicleLayer);
+if (document.getElementById('toggleCameras').checked) map.addLayer(cameraLayer);
+if (document.getElementById('toggleIncidents').checked) map.addLayer(incidentLayer);
+if (document.getElementById('toggleTrainStops').checked) map.addLayer(trainStopsCluster);
+
+/* ================= Cameras (unchanged) ================= */
+const trafficCameras = [
+  { location: [-26.675690289799306, 153.09611092387337], imageUrl: "https://cameras.qldtraffic.qld.gov.au/Sunshine_Coast/MRNCHD-437.jpg", name: "Mooloolaba Road & Sugar Road" },
+  { location: [-27.558200838017495, 153.01856082368514], imageUrl: "https://cameras.qldtraffic.qld.gov.au/Metropolitan/MRMETRO-1458.jpg", name: "Beaudesert Road & Granard Road" },
+  { location: [-27.55582423788164, 153.00842617897055], imageUrl: "https://cameras.qldtraffic.qld.gov.au/Metropolitan/Archerfield_Ipswich_Mwy_sth.jpg", name: "Ipswich Motorway & Granard Rd North" },
+  { location: [-27.55656219407607, 153.00773877467412], imageUrl: "https://cameras.qldtraffic.qld.gov.au/Metropolitan/MRMETRO-1223.jpg", name: "Ipswich Motorway & Granard Rd South" },
+  { location: [-27.455272568421712, 153.10719534216116], imageUrl: "https://cameras.qldtraffic.qld.gov.au/Metropolitan/gateway.jpg", name: "Gateway Bridge - North" },
+  { location: [-27.454941749846192, 153.10676707635102], imageUrl: "https://cameras.qldtraffic.qld.gov.au/Metropolitan/MRMETRO-1465.jpg", name: "Gateway Motorway & Lytton Road - South" },
+  { location: [-27.495165135286648, 153.03808203328092], imageUrl: "https://cameras.qldtraffic.qld.gov.au/Metropolitan/MRMETRO-1214.jpg", name: "Pacific Motorway & Arrow Street - Northwest" },
+  { location: [-27.434066336378994, 153.08570809871122], imageUrl: "https://cameras.qldtraffic.qld.gov.au/Metropolitan/Whinstanes_Gateway_Mwy_Nth.jpg", name: "Whinstanes - Gateway Motorway & Links Avenue" },
+  { location: [-27.548719450180034, 153.06560412067955], imageUrl: "https://cameras.qldtraffic.qld.gov.au/Metropolitan/Upper_MtGravatt_Pac_Mwy_Nth.jpg", name: "Pacific Motorway & Klumpp Road" },
+  { location: [-27.478353412027573, 152.98479245360403], imageUrl: "https://cameras.qldtraffic.qld.gov.au/Metropolitan/Toowong_MtCootha_West.jpg", name: "Mount Coot-Tha Road & Miskin Street" }
+];
+
+function safeDomId(s) {
+  const safe = String(s).replace(/[^a-zA-Z0-9-_]/g, '-').slice(0,60);
+  return 'cam-' + (safe || Math.random().toString(36).slice(2,8));
+}
+
+let cameraTimers = [];
+function addTrafficCameras(cameras) {
+  cameraLayer.clearLayers();
+  cameraTimers.forEach(t => clearInterval(t));
+  cameraTimers = [];
+
+  const cameraCluster = L.markerClusterGroup();
+  cameras.forEach(cam => {
+    const domId = safeDomId(cam.name);
+    const marker = L.marker(cam.location);
+    const popup = L.popup({ maxWidth: 380 }).setContent(`
+      <div style="font-weight:700;margin-bottom:6px;">${cam.name}</div>
+      <img id="${domId}" class="camera-img" src="${cam.imageUrl}?_=${Date.now()}" alt="${cam.name}">
+      <div style="font-size:12px;color:#ddd;margin-top:6px;">Updated: <span id="${domId}-t">now</span></div>
+    `);
+    marker.bindPopup(popup);
+    cameraCluster.addLayer(marker);
+
+    // refresh every 5s
+    const t = setInterval(()=> {
+      const img = document.getElementById(domId);
+      const tm = document.getElementById(domId + '-t');
+      if (img) img.src = cam.imageUrl + '?_=' + Date.now();
+      if (tm) tm.textContent = new Date().toLocaleTimeString();
+    }, 5000);
+    cameraTimers.push(t);
+  });
+
+  cameraLayer.addLayer(cameraCluster);
+  setStatus('Cameras loaded: ' + cameras.length);
+}
+addTrafficCameras(trafficCameras);
+
+/* camera toggle */
+document.getElementById('toggleCameras').addEventListener('change', function(e){
+  if (e.target.checked) map.addLayer(cameraLayer); else map.removeLayer(cameraLayer);
+});
+
+/* ================= Live GTFS-RT Vehicles (restored to your original approach, but safer) ================= */
+const vehicleMarkers = {}; // vehicleId => { marker, previous: [lat,lon], paths: [] }
+const maxPathsPerVehicle = 80; // cap so it doesn't explode
+
+function getSafeVehicleId(entity) {
+  try {
+    if (entity.vehicle && entity.vehicle.vehicle && entity.vehicle.vehicle.id) return String(entity.vehicle.vehicle.id);
+    if (entity.vehicle && entity.vehicle.vehicle && entity.vehicle.vehicle.label) return String(entity.vehicle.vehicle.label);
+    if (entity.id) return String(entity.id);
+  } catch(e) {}
+  return 'veh_' + Math.random().toString(36).slice(2,9);
+}
+
+async function fetchVehiclePositions_originalStyle() {
+  try {
+    const url = 'https://gtfsrt.api.translink.com.au/api/realtime/SEQ/VehiclePositions';
+    const res = await fetch(url, { cache: 'no-store' });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const buffer = await res.arrayBuffer();
+
+    // load proto over network (as your original did)
+    const root = await protobuf.load("https://raw.githubusercontent.com/google/transit/master/gtfs-realtime/proto/gtfs-realtime.proto");
+    const FeedMessage = root.lookupType("transit_realtime.FeedMessage");
+
+    const decoded = FeedMessage.decode(new Uint8Array(buffer));
+    // convert to object form for easier safe access
+    const obj = FeedMessage.toObject(decoded, { longs: String, enums: String, bytes: String });
+
+    const positions = []; // for proximity checks if need be
+    let seen = 0;
+
+    if (Array.isArray(obj.entity)) {
+      obj.entity.forEach(ent => {
+        try {
+          if (!ent.vehicle || !ent.vehicle.position) return;
+          const pos = ent.vehicle.position;
+          const lat = Number(pos.latitude);
+          const lon = Number(pos.longitude);
+          if (!Number.isFinite(lat) || !Number.isFinite(lon)) return;
+          const vid = getSafeVehicleId(ent);
+
+          seen++;
+          positions.push({ vid, lat, lon });
+
+          if (!vehicleMarkers[vid]) {
+            // create new marker
+            const marker = L.marker([lat, lon], { icon: L.divIcon({ className:'veh-icon', html:'<svg width="10" height="10"><circle cx="5" cy="5" r="4" fill="#00aaff"/></svg>' }) })
+              .bindPopup(`<strong>Vehicle ID:</strong> ${vid}<br><strong>Trip:</strong> ${ent.trip ? ent.trip.trip_id || 'N/A' : 'N/A'}`);
+            marker.addTo(vehicleLayer);
+            vehicleMarkers[vid] = { marker, previous: [lat, lon], paths: [] };
+          } else {
+            // update existing marker
+            const vm = vehicleMarkers[vid];
+            const prev = vm.previous;
+            const curr = [lat, lon];
+
+            if (document.getElementById('traceToggle').checked) {
+              const line = L.polyline([prev, curr], { color: '#ff5b5b', weight: 2, opacity: 0.95 }).addTo(vehicleLayer);
+              vm.paths.push(line);
+              if (vm.paths.length > maxPathsPerVehicle) {
+                const rem = vm.paths.shift();
+                try { vehicleLayer.removeLayer(rem); } catch(e){/*ignore*/ }
+              }
+            }
+
+            try { vm.marker.setLatLng(curr); } catch(e){ console.warn('marker update err', e); }
+            vm.previous = curr;
+          }
+        } catch(inner){
+          console.warn('entity parse inner err', inner);
+        }
+      });
+    }
+
+    setStatus('Vehicles: ' + seen);
+  } catch (err) {
+    console.error('Failed to fetch/parse GTFS-RT (vehicles):', err);
+    setStatus('Vehicle feed failed (CORS/HTTP). See console.');
+  }
+}
+
+/* Vehicle polling management */
+let vehiclePollHandle = null;
+function startVehiclePolling() {
+  const ms = Number(document.getElementById('refreshInterval').value) || 30000;
+  if (vehiclePollHandle) clearInterval(vehiclePollHandle);
+  // immediate fetch then interval
+  fetchVehiclePositions_originalStyle();
+  vehiclePollHandle = setInterval(fetchVehiclePositions_originalStyle, ms);
+}
+startVehiclePolling();
+
+/* Wire vehicle toggle */
+document.getElementById('toggleVehicles').addEventListener('change', function(e){
+  if (e.target.checked) map.addLayer(vehicleLayer); else map.removeLayer(vehicleLayer);
+});
+
+/* ================= QLD Traffic incidents (keeps prior approach) ================= */
+async function fetchIncidents() {
+  const url = 'https://api.qldtraffic.qld.gov.au/v1/events';
+  try {
+    const res = await fetch(url, { cache:'no-store' });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const data = await res.json();
+    incidentLayer.clearLayers();
+    let cnt = 0;
+    if (Array.isArray(data.events)) {
+      data.events.forEach(ev => {
+        if (!ev.location || !ev.location.latitude || !ev.location.longitude) return;
+        cnt++;
+        L.marker([ev.location.latitude, ev.location.longitude]).bindPopup(`<strong>${ev.headline||'Incident'}</strong><br>${ev.description||''}`).addTo(incidentLayer);
+      });
+    }
+    setStatus('Incidents: ' + cnt);
+  } catch (err) {
+    console.warn('Incidents fetch error (CORS/HTTP?):', err);
+    setStatus('Incidents feed failed (CORS/HTTP). See console.');
+  }
+}
+let incidentPollHandle = null;
+function startIncidentPolling() {
+  const ms = Number(document.getElementById('refreshInterval').value) || 60000;
+  if (incidentPollHandle) clearInterval(incidentPollHandle);
+  fetchIncidents();
+  incidentPollHandle = setInterval(fetchIncidents, ms);
+}
+startIncidentPolling();
+document.getElementById('toggleIncidents').addEventListener('change', function(e){
+  if (e.target.checked) map.addLayer(incidentLayer); else map.removeLayer(incidentLayer);
+});
+
+/* ================= Train  ================= */
+const trainStops = [
+  {name:"Roma Street Station", lat:-27.465, lon:153.017},
+  {name:"South Bank Station", lat:-27.481, lon:153.021},
+  {name:"Fortitude Valley Station", lat:-27.455, lon:153.033}
+];
+trainStops.forEach(s => {
+  trainStopsCluster.addLayer(L.marker([s.lat, s.lon]).bindPopup(`<strong>${s.name}</strong>`));
+});
+document.getElementById('toggleTrainStops').addEventListener('change', function(e){
+  if (e.target.checked) map.addLayer(trainStopsCluster); else map.removeLayer(trainStopsCluster);
+});
+
+/* ================= Bus stops ================= */
+/*
+  Using Overpass to fetch bus_stop nodes inside SEQ bounding box.
+  SEQ bbox approx: south=-28, west=152, north=-26, east=154
+*/
+async function fetchBusStopsOverpass() {
+  const bbox = "-28,152,-26,154"; // south,west,north,east
+  const query = `[out:json][timeout:25];node["highway"="bus_stop"](${bbox});out body;`;
+  const url = 'https://overpass-api.de/api/interpreter?data=' + encodeURIComponent(query);
+
+  try {
+    const res = await fetch(url);
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const j = await res.json();
+    busStopsLayer.clearLayers();
+    let count = 0;
+    const nodes = j.elements || [];
+    nodes.forEach(n => {
+      if (n && n.lat && n.lon) {
+        count++;
+        const name = (n.tags && (n.tags.name || n.tags.ref)) || 'Bus stop';
+        // circleMarker uses pixel radius (constant on zoom) which is what you requested
+        const dot = L.circleMarker([n.lat, n.lon], {
+          radius: 1,   // very tiny, user must zoom in
+          color: '#ff9900',
+          weight: 1,
+          fillColor: '#ff9900',
+          fillOpacity: 0.85
+        }).bindPopup(`<strong>${name}</strong><br><small>OSM id: ${n.id}</small>`);
+        busStopsLayer.addLayer(dot);
+      }
+    });
+    setStatus('Bus stops (OSM): ' + count);
+  } catch (err) {
+    console.error('Bus stops Overpass fetch failed:', err);
+    setStatus('Bus stops load failed (Overpass/CORS). See console.');
+  }
+}
+
+/* Bus stops toggle wiring (no clustering) */
+document.getElementById('toggleBusStops').addEventListener('change', function(e){
+  if (e.target.checked) {
+    map.addLayer(busStopsLayer);
+    // fetch once when first enabled
+    if (busStopsLayer.getLayers().length === 0) fetchBusStopsOverpass();
+  } else {
+    map.removeLayer(busStopsLayer);
+  }
+});
+
+/* ================= Rail lines — Overpass ways (PURPLE color) ================= */
+/*
+  Query railway=rail ways within SEQ bbox and draw as polylines.
+*/
+async function fetchRailLinesOverpass() {
+  const bbox = "-28,152,-26,154";
+  const query = `[out:json][timeout:25];(way["railway"="rail"](${bbox}););out body;>;out skel qt;`;
+  const url = 'https://overpass-api.de/api/interpreter?data=' + encodeURIComponent(query);
+  try {
+    const res = await fetch(url);
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const j = await res.json();
+    // collect nodes
+    const nodes = {};
+    j.elements.forEach(el => { if (el.type === 'node') nodes[el.id] = [el.lat, el.lon]; });
+    // draw ways
+    railLinesLayer.clearLayers();
+    let wayCount = 0;
+    j.elements.forEach(el => {
+      if (el.type === 'way' && Array.isArray(el.nodes)) {
+        const coords = el.nodes.map(id => nodes[id]).filter(Boolean);
+        if (coords.length > 1) {
+          // coords are [lat, lon] pairs already
+          L.polyline(coords, { color: '#8000ff', weight: 3, opacity: 0.85 }).addTo(railLinesLayer);
+          wayCount++;
+        }
+      }
+    });
+    setStatus('Rail lines: ' + wayCount + ' ways drawn.');
+  } catch (err) {
+    console.error('Rail lines Overpass fetch failed:', err);
+    setStatus('Rail lines load failed (Overpass/CORS). See console.');
+  }
+}
+/* ================= Parks (Overpass) ================= */
+const parksLayer = L.layerGroup();
+
+async function fetchParksOverpass() {
+  const bbox = "-28,152,-26,154"; // SEQ bounding box
+  const query = `[out:json][timeout:25];way["leisure"="park"](${bbox});out body;>;out skel qt;`;
+  const url = 'https://overpass-api.de/api/interpreter?data=' + encodeURIComponent(query);
+
+  try {
+    const res = await fetch(url);
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const j = await res.json();
+
+    // Build a node lookup for ways
+    const nodes = {};
+    j.elements.forEach(el => {
+      if (el.type === "node") nodes[el.id] = [el.lat, el.lon];
+    });
+
+    parksLayer.clearLayers();
+    let count = 0;
+
+    j.elements.forEach(el => {
+      if (el.type === "way" && Array.isArray(el.nodes)) {
+        const coords = el.nodes.map(id => nodes[id]).filter(Boolean);
+        if (coords.length > 2) {
+          L.polygon(coords, {
+            color: "#2ecc71",
+            weight: 1,
+            fillOpacity: 0.3
+          }).bindPopup("Park / leisure area").addTo(parksLayer);
+          count++;
+        }
+      }
+    });
+
+    setStatus("Parks drawn: " + count);
+  } catch (err) {
+    console.error("Parks Overpass fetch failed:", err);
+    setStatus("Parks load failed.");
+  }
+}
+
+// Hook into sidebar checkbox
+document.getElementById("toggleParks").addEventListener("change", e => {
+  if (e.target.checked) {
+    map.addLayer(parksLayer);
+    if (parksLayer.getLayers().length === 0) fetchParksOverpass();
+  } else {
+    map.removeLayer(parksLayer);
+  }
+});
+
+/* ================= Infrastructure (Schools, Hospitals, Police, Fire, Fuel) ================= */
+const infraLayer = L.layerGroup();
+
+async function fetchInfrastructureOverpass() {
+  const bbox = "-28,152,-26,154"; // SEQ bounding box
+  const query = `
+    [out:json][timeout:25];
+    (
+      node["amenity"="school"](${bbox});
+      node["amenity"="college"](${bbox});
+      node["amenity"="university"](${bbox});
+      node["amenity"="hospital"](${bbox});
+      node["amenity"="clinic"](${bbox});
+      node["amenity"="police"](${bbox});
+      node["amenity"="fire_station"](${bbox});
+      node["amenity"="fuel"](${bbox});
+    );
+    out body;
+  `;
+  const url = "https://overpass-api.de/api/interpreter?data=" + encodeURIComponent(query);
+
+  try {
+    const res = await fetch(url);
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const j = await res.json();
+
+    infraLayer.clearLayers();
+    let count = 0;
+
+    (j.elements || []).forEach(n => {
+      if (n && n.lat && n.lon) {
+        count++;
+        const type = n.tags?.amenity || "amenity";
+        const name = n.tags?.name || type;
+
+        // Pick color by type
+        let color = "#3498db"; // default blue
+        if (["hospital","clinic"].includes(type)) color = "#e74c3c";   // red
+        else if (["school","college","university"].includes(type)) color = "#f1c40f"; // yellow
+        else if (type === "police") color = "#2ecc71";                 // green
+        else if (type === "fire_station") color = "#ff6600";           // orange
+        else if (type === "fuel") color = "#9b59b6";                   // purple
+
+        const marker = L.marker([n.lat, n.lon], {
+          icon: L.divIcon({
+            className: "",
+            html: `<div style="width:10px;height:10px;border-radius:50%;background:${color};border:1px solid #333"></div>`,
+            iconSize: [10, 10],
+            iconAnchor: [5, 5]
+          })
+        }).bindPopup(`<strong>${name}</strong><br><small>${type}</small><br><small>OSM id: ${n.id}</small>`);
+
+        infraLayer.addLayer(marker);
+      }
+    });
+
+    setStatus("Infrastructure sites: " + count);
+  } catch (err) {
+    console.error("Infrastructure fetch failed:", err);
+    setStatus("Infrastructure load failed.");
+  }
+}
+
+// Sidebar toggle
+document.getElementById("toggleInfrastructure").addEventListener("change", e => {
+  if (e.target.checked) {
+    map.addLayer(infraLayer);
+    if (infraLayer.getLayers().length === 0) fetchInfrastructureOverpass();
+  } else {
+    map.removeLayer(infraLayer);
+  }
+});
+
+
+
+
+/* Rail lines toggle wiring */
+document.getElementById('toggleRailLines').addEventListener('change', function(e){
+  if (e.target.checked) {
+    map.addLayer(railLinesLayer);
+    if (railLinesLayer.getLayers().length === 0) fetchRailLinesOverpass();
+  } else {
+    map.removeLayer(railLinesLayer);
+  }
+});
+
+/* ================= Refresh interval wiring ================= */
+document.getElementById('refreshInterval').addEventListener('change', function() {
+  // restart polling intervals
+  startVehiclePolling();
+  startIncidentPolling();
+});
+
+/* ================= Clean-up on unload ================= */
+window.addEventListener('beforeunload', () => {
+  if (vehiclePollHandle) clearInterval(vehiclePollHandle);
+  if (incidentPollHandle) clearInterval(incidentPollHandle);
+  cameraTimers.forEach(t => clearInterval(t));
+});
+
+/* ================= Final message ================= */
+setStatus('Map ready. Cameras unchanged. Vehicles restored to original GTFS-RT flow. Bus stops: tiny non-clustered dots. Rail lines: purple. Base maps added.');
+</script>
+</body>
+</html>
